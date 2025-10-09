@@ -135,10 +135,13 @@ class SubscriptionManager:
                 client_state = sub.get('clientState', 'N/A')
                 expiration = sub.get('expirationDateTime', 'N/A')
 
-                # Determinar tipo
-                if 'inbox' in resource.lower():
+                # Determinar tipo (protegiendo contra None)
+                resource_lower = (resource or '').lower()
+                client_state_lower = (client_state or '').lower()
+                
+                if 'inbox' in resource_lower:
                     sub_type = 'INBOX'
-                elif 'hil' in resource.lower() or 'hil' in client_state.lower():
+                elif 'hil' in resource_lower or 'hil' in client_state_lower:
                     sub_type = 'HIL'
                 else:
                     sub_type = 'OTHER'
