@@ -26,3 +26,7 @@ dist/
 
 # Otros
 .coverage
+
+# Archivos de configuración de contenedores
+Makefile
+verify-setup.sh

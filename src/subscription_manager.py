@@ -184,25 +184,40 @@ class SubscriptionManager:
             Dict con la información de la suscripción o None si falla.
         """
         logger.info("Creando suscripción INBOX...")
-        
+
         # Calcular expiración (máximo 4230 minutos para empresarial)
         try:
             expiration = datetime.now(timezone.utc) + timedelta(days=2, hours=23)
-        
+
         except ImportError:
             expiration = datetime.utcnow() + timedelta(days=2, hours=23)
-        
+
         expiration_str = expiration.strftime('%Y-%m-%dT%H:%M:%S.0000000Z')
-        
+
+        # ============================================================================
+        # ACTUALIZADO: Ahora usa webhook_url_inbox específica (nuevo servicio AWS)
+        # ============================================================================
+        # CÓDIGO ANTIGUO (comentado para pruebas):
+        # webhook_data = {
+        #     "changeType": "created",
+        #     "notificationUrl": self.config.webhook_url,  # <-- URL antigua compartida
+        #     "resource": f"users/{self.config.target_user_email}/mailFolders/inbox/messages",
+        #     "expirationDateTime": expiration_str,
+        #     "clientState": "InboxSecretState123"
+        # }
+
+        # CÓDIGO NUEVO (activo):
         webhook_data = {
-            "changeType": "created",  
-            "notificationUrl": self.config.webhook_url,
+            "changeType": "created",
+            "notificationUrl": self.config.webhook_url_inbox,  # <-- URL nueva específica para INBOX
             "resource": f"users/{self.config.target_user_email}/mailFolders/inbox/messages",
             "expirationDateTime": expiration_str,
             "clientState": "InboxSecretState123"
         }
+        # ============================================================================
 
         logger.info(f"Configurando suscripción INBOX que expira: {expiration_str}")
+        logger.info(f"URL notificación INBOX: {self.config.webhook_url_inbox}")
 
         result = self._make_graph_request("/subscriptions", "POST", webhook_data)
 
@@ -228,18 +243,23 @@ class SubscriptionManager:
             if not folders_data or 'value' not in folders_data:
                 logger.error("No se pudieron obtener las carpetas")
                 return None
-            
-            # Buscar carpeta HIL
-            for folder in folders_data['value']:
-                folder_name = (folder.get('displayName') or '').lower()
 
-                if folder_name == 'hil':
-                    folder_id = folder.get('id')
-                    logger.info(f'Carpeta HIL encontrada: {folder_id}')
+            # Buscar carpeta HIL
+            logger.info(f"Total carpetas a revisar: {len(folders_data['value'])}")
+            for folder in folders_data['value']:
+                folder_name = folder.get('displayName') or ''
+                folder_id = folder.get('id')
+
+                # Log TODAS las carpetas para debugging
+                logger.info(f"Carpeta encontrada: '{folder_name}' -> lower: '{folder_name.lower()}'")
+
+                if folder_name.lower() == 'hil':
+                    logger.info(f'✓ Carpeta HIL encontrada: {folder_id}')
                     return folder_id
-            
+
             # Si no existe, crearla
-            logger.info("Creando carpeta HIL...")
+            logger.warning("Carpeta HIL NO encontrada en la búsqueda")
+            logger.info("Intentando crear carpeta HIL...")
             create_data = {"displayName": "HIL"}
 
             result = self._make_graph_request(f'/users/{self.config.target_user_email}/mailFolders', 'POST', create_data)
@@ -251,7 +271,7 @@ class SubscriptionManager:
             else:
                 logger.error("Error creando carpeta HIL")
                 return None
-        
+
         except Exception as e:
             logger.error(f"Error con carpeta HIL: {str(e)}")
             return None
@@ -270,28 +290,43 @@ class SubscriptionManager:
         if not hil_folder_id:
             logger.error("No se pudo obtener o crear la carpeta HIL")
             return None
-        
+
         # Calcular expiración
         try:
             from datetime import timezone
             expiration = datetime.now(timezone.utc) + timedelta(days=2, hours=23)
         except ImportError:
             expiration = datetime.utcnow() + timedelta(days=2, hours=23)
-        
+
         expiration_str = expiration.strftime('%Y-%m-%dT%H:%M:%S.0000000Z')
-        
+
+        # ============================================================================
+        # ACTUALIZADO: Ahora usa webhook_url_hil específica (servicio actual)
+        # ============================================================================
+        # CÓDIGO ANTIGUO (comentado para pruebas):
+        # webhook_data = {
+        #     "changeType": "created",
+        #     "notificationUrl": self.config.webhook_url,  # <-- URL antigua compartida
+        #     "resource": f"users/{self.config.target_user_email}/mailFolders/{hil_folder_id}/messages",
+        #     "expirationDateTime": expiration_str,
+        #     "clientState": "HILSecretState456"
+        # }
+
+        # CÓDIGO NUEVO (activo):
         webhook_data = {
             "changeType": "created",
-            "notificationUrl": self.config.webhook_url,
+            "notificationUrl": self.config.webhook_url_hil,  # <-- URL específica para HIL
             "resource": f"users/{self.config.target_user_email}/mailFolders/{hil_folder_id}/messages",
             "expirationDateTime": expiration_str,
             "clientState": "HILSecretState456"
         }
+        # ============================================================================
 
         logger.info(f"Configurando suscripción HIL que expira: {expiration_str}")
+        logger.info(f"URL notificación HIL: {self.config.webhook_url_hil}")
 
         result = self._make_graph_request('/subscriptions', 'POST', webhook_data)
-        
+
         if result and 'id' in result:
             logger.info(f'Suscripción HIL creada: {result.get("id")}')
             return result
@@ -339,14 +374,16 @@ class SubscriptionManager:
             else:
                 results['errors'].append('Error creando suscripción INBOX')
                 results['success'] = False
-            
-            # 4. Crear nueva suscripción HIL
-            hil_result = self.create_hil_subscription()
-            if hil_result:
-                results['created_subscriptions'] += 1
-            else:
-                results['errors'].append('Error creando suscripción HIL')
-                results['success'] = False
+
+            # 4. DESHABILITADO: Suscripción HIL ya no es necesaria
+            # hil_result = self.create_hil_subscription()
+            # if hil_result:
+            #     results['created_subscriptions'] += 1
+            # else:
+            #     results['errors'].append('Error creando suscripción HIL')
+            #     results['success'] = False
+
+            logger.info("Suscripción HIL deshabilitada (ya no es necesaria)")
             
             logger.info(f'Procesamiento completado:')
             logger.info(f'Existentes: {results["existing_subscriptions"]}')

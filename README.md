@@ -49,17 +49,49 @@ Copia `.env.example` y configura las variables:
 ```bash
 # Microsoft Graph API
 MS_TENANT_ID=tu_tenant_id
-MS_CLIENT_ID=tu_client_id  
+MS_CLIENT_ID=tu_client_id
 MS_CLIENT_SECRET=tu_client_secret
 
 # Configuración objetivo
 TARGET_USER_EMAIL=helpdesk_ivanti@siman.com
+
+# ⚠️ ACTUALIZADO: URLs separadas por suscripción (RECOMENDADO)
+# ================================================================
+# IMPORTANTE: Cada suscripción ahora puede tener su propia URL de webhook
+WEBHOOK_URL_INBOX=https://tu-servicio-nuevo.amazonaws.com/inbox-webhook
+WEBHOOK_URL_HIL=https://tu-webhook-actual.amazonaws.com/clasificador-emails-v2
+
+# LEGACY: URL compartida (solo para backward compatibility)
+# Si no se especifican WEBHOOK_URL_INBOX y WEBHOOK_URL_HIL,
+# se usará esta URL para ambas suscripciones
 WEBHOOK_URL=https://tu-webhook-url.amazonaws.com/clasificador-emails-v2
+# ================================================================
 
 # Opcional
 HIL_FORWARD_TO_EMAIL=destino@ejemplo.com
 LAMBDA_VERSION=1.0.0
 LOG_LEVEL=INFO
+```
+
+#### 📌 Notas Importantes sobre URLs de Webhook
+
+**URLs Separadas (Nuevo - Recomendado):**
+- `WEBHOOK_URL_INBOX`: URL específica para notificaciones de INBOX (nuevo servicio AWS)
+- `WEBHOOK_URL_HIL`: URL específica para notificaciones de HIL (servicio actual)
+
+**Backward Compatibility:**
+- Si solo defines `WEBHOOK_URL`, ambas suscripciones usarán esa URL
+- Si defines `WEBHOOK_URL_INBOX` y `WEBHOOK_URL_HIL`, se ignorará `WEBHOOK_URL`
+- Las variables específicas tienen prioridad sobre la variable legacy
+
+**Ejemplo de Configuración:**
+```bash
+# ✅ Configuración nueva (URLs separadas)
+WEBHOOK_URL_INBOX=https://servicio-nuevo.com/inbox
+WEBHOOK_URL_HIL=https://servicio-actual.com/hil
+
+# ✅ Configuración legacy (URL compartida) - Aún funcional
+WEBHOOK_URL=https://servicio-unico.com/webhook
 ```
 
 ### 2. Configuración Manual en AWS
@@ -216,6 +248,13 @@ graph TD
 ```
 
 ## 📝 Changelog
+
+### v2.0.0 (ACTUAL)
+- 🆕 **URLs separadas por suscripción**: Ahora INBOX y HIL pueden usar webhooks diferentes
+- ✅ Soporte para `WEBHOOK_URL_INBOX` y `WEBHOOK_URL_HIL`
+- ✅ Backward compatibility con `WEBHOOK_URL` legacy
+- ✅ Logging mejorado con URLs específicas por suscripción
+- ✅ Código antiguo comentado para referencia y rollback
 
 ### v1.0.0
 - ✅ Implementación inicial

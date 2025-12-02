@@ -1,0 +1,36 @@
+# Entorno virtual de Python
+venv/
+.venv/
+ENV/
+
+# Archivos sensibles con credenciales
+.env
+.env.example
+
+# Scripts de despliegue y herramientas locales
+Makefile
+*.sh
+.dockerignore
+Dockerfile
+.gitignore
+
+# Archivos de testing local y documentación
+main.py
+README.md
+
+# Archivos de Git
+.git/
+.github/
+
+# Archivos compilados y cache de Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Archivos de configuración de IDEs
+.vscode/
+.idea/
+
+# Archivos de logs
+*.log
