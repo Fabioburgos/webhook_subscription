@@ -1,400 +1,344 @@
-# src/subscription_manager.py -> 'Gestor de suscripciones'
+# src/subscription_manager.py -> 'Gestor de suscripciones multi-tenant'
 
-import json
-import base64
 import requests
-from .config import Config
-from .utils import setup_logging
-from typing import Dict, List, Optional, Any
-from datetime import datetime, timedelta, timezone
+from typing import Dict, Any
+from .dynamodb_client import DynamoDBClient
+from datetime import datetime, timezone, timedelta
+from .utils import setup_logging, is_subscription_expired
 
 logger = setup_logging()
 
-class SubscriptionManager:
-    """ Gestiona las suscripciones de webhook de Microsoft Graph. """
-
-    def __init__(self, config: Config):
-        self.config = config
-        self.access_token: Optional[str] = None
-        self.base_url = "https://graph.microsoft.com/v1.0"
-
-    def get_access_token(self) -> bool:
+class MultiTenantSubscriptionManager:
+    """
+    Gestor de suscripciones para MÚLTIPLES clientes.
+    
+    FLUJO (Reconciliation Loop):
+    1. Leer TODOS los clientes activos de DynamoDB
+    2. Para CADA cliente:
+       a. Autenticarse con SUS credenciales Azure
+       b. Verificar si tiene suscripción activa en Graph API
+       c. Si NO tiene o está expirada → crear/renovar
+       d. Actualizar DynamoDB con subscription_id real
+    
+    Este lambda es IDEMPOTENTE - ejecutarlo múltiples veces converge al mismo estado.
+    """
+    
+    def __init__(self):
+        """Inicializa el gestor multi-tenant"""
+        self.db_client = DynamoDBClient()
+        self.graph_api_base = "https://graph.microsoft.com/v1.0"
+        logger.info("MultiTenantSubscriptionManager inicializado")
+    
+    def process_all_subscriptions(self) -> Dict[str, Any]:
         """
-        Obtiene un token de acceso usando Client Credentials Flow.
-
+        Procesa suscripciones para TODOS los clientes activos.
+        
+        Este es el método principal que llama el lambda handler.
+        
         Returns:
-            bool: True si se obtuvo el token correctamente, False en caso contrario.
+            Dict con resultados del procesamiento
         """
-        token_url = f"https://login.microsoftonline.com/{self.config.tenant_id}/oauth2/v2.0/token"
-
-        data = {
-            "client_id": self.config.client_id,
-            "scope": 'https://graph.microsoft.com/.default',
-            'client_secret': self.config.client_secret,
-            'grant_type': 'client_credentials'
+        logger.info("="*60)
+        logger.info("INICIANDO PROCESAMIENTO MULTI-TENANT")
+        logger.info("="*60)
+        
+        results = {
+            'success': True,
+            'total_clients': 0,
+            'processed': [],
+            'failed': [],
+            'skipped': []
         }
-
+        
         try:
-            response = requests.post(token_url, data = data, timeout = 30)
-            response.raise_for_status()
-
-            token_data = response.json()
-            self.access_token = token_data.get("access_token")
-
-            # Log de permisos (DEBUGGING)
-            if self.access_token:
-                self._log_token_permissions()
+            # 1. Obtener TODOS los clientes activos
+            clients = self.db_client.get_all_active_clients()
+            results['total_clients'] = len(clients)
             
-            logger.info("Token de acceso obtenido correctamente")
-            return True
-
+            if not clients:
+                logger.warning("No hay clientes activos en DynamoDB")
+                results['success'] = False
+                results['message'] = "No hay clientes activos"
+                return results
+            
+            logger.info(f"\nProcesando {len(clients)} cliente(s)...\n")
+            
+            # 2. Procesar CADA cliente
+            for idx, client_config in enumerate(clients, 1):
+                client_id = client_config.get('client_id', 'unknown')
+                
+                logger.info(f"{'='*60}")
+                logger.info(f"CLIENTE {idx}/{len(clients)}: {client_id}")
+                logger.info(f"{'='*60}")
+                
+                try:
+                    result = self._process_client_subscription(client_config)
+                    
+                    if result['action'] == 'created' or result['action'] == 'renewed':
+                        results['processed'].append({
+                            'client_id': client_id,
+                            'action': result['action'],
+                            'subscription_id': result.get('subscription_id', 'N/A')[:40]
+                        })
+                        logger.info(f"Cliente {client_id}: {result['action']}")
+                        
+                    elif result['action'] == 'skipped':
+                        results['skipped'].append({
+                            'client_id': client_id,
+                            'reason': result.get('reason', 'N/A')
+                        })
+                        logger.info(f"⏭Cliente {client_id}: {result['reason']}")
+                    
+                except Exception as e:
+                    logger.error(f"Error procesando cliente {client_id}: {e}")
+                    results['failed'].append({
+                        'client_id': client_id,
+                        'error': str(e)
+                    })
+                    results['success'] = False
+                
+                logger.info("")  # Línea en blanco entre clientes
+            
+            # 3. Resumen final
+            logger.info("="*60)
+            logger.info("RESUMEN DE PROCESAMIENTO")
+            logger.info("="*60)
+            logger.info(f"Total clientes: {results['total_clients']}")
+            logger.info(f"Procesados: {len(results['processed'])}")
+            logger.info(f"Saltados: {len(results['skipped'])}")
+            logger.info(f"Fallidos: {len(results['failed'])}")
+            logger.info("="*60)
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"Error crítico en procesamiento: {e}", exc_info=True)
+            results['success'] = False
+            results['error'] = str(e)
+            return results
+    
+    def _process_client_subscription(self, client_config: Dict) -> Dict[str, Any]:
+        """
+        Procesa la suscripción de UN cliente específico.
+        
+        Lógica:
+        1. Autenticarse con credenciales del cliente
+        2. Verificar si tiene suscripción en Graph API
+        3. Si NO tiene o está expirada → crear/renovar
+        4. Actualizar DynamoDB con subscription_id real
+        
+        Args:
+            client_config: Configuración del cliente desde DynamoDB
+            
+        Returns:
+            Dict con resultado del procesamiento
+        """
+        client_id = client_config.get('client_id')
+        client_email = client_config.get('client_email')
+        current_sub_id = client_config.get('subscription_id')
+        
+        logger.info(f"Cliente: {client_id}")
+        logger.info(f"Email: {client_email}")
+        logger.info(f"Subscription ID actual: {current_sub_id[:40]}...")
+        
+        # 1. Obtener token de acceso con credenciales del cliente
+        logger.info("Obteniendo token de acceso...")
+        access_token = self._get_access_token_for_client(client_config)
+        
+        if not access_token:
+            raise Exception("No se pudo obtener token de acceso")
+        
+        logger.info("Token obtenido")
+        
+        # 2. Verificar si necesita suscripción nueva
+        needs_subscription = self._needs_subscription(
+            current_sub_id,
+            client_config.get('subscription_expiry')
+        )
+        
+        if not needs_subscription:
+            logger.info("Suscripción vigente, no requiere renovación")
+            return {
+                'action': 'skipped',
+                'reason': 'Suscripción aún vigente'
+            }
+        
+        # 3. Crear suscripción en Graph API
+        logger.info("Creando suscripción en Graph API...")
+        subscription_data = self._create_subscription_in_graph(
+            access_token,
+            client_email,
+            client_config.get('webhook_url')
+        )
+        
+        if not subscription_data:
+            raise Exception("No se pudo crear suscripción en Graph API")
+        
+        new_sub_id = subscription_data['id']
+        expiry_date = subscription_data['expirationDateTime']
+        
+        logger.info("Suscripción creada:")
+        logger.info(f"   ID: {new_sub_id[:40]}...")
+        logger.info(f"   Expira: {expiry_date}")
+        
+        # 4. Actualizar DynamoDB
+        logger.info("Actualizando DynamoDB...")
+        success = self.db_client.update_subscription_id(
+            old_subscription_id = current_sub_id,
+            new_subscription_id = new_sub_id,
+            expiry_datetime = expiry_date
+        )
+        
+        if not success:
+            logger.warning("No se pudo actualizar DynamoDB (pero suscripción sí se creó)")
+        else:
+            logger.info("DynamoDB actualizado")
+        
+        action = 'created' if 'pending' in current_sub_id else 'renewed'
+        
+        return {
+            'action': action,
+            'subscription_id': new_sub_id,
+            'expiry': expiry_date
+        }
+    
+    def _get_access_token_for_client(self, client_config: Dict) -> str:
+        """
+        Obtiene token de acceso para un cliente específico.
+        
+        Usa las credenciales Azure del cliente (tenant_id, client_id, client_secret).
+        
+        Args:
+            client_config: Configuración del cliente
+            
+        Returns:
+            Access token o None si falla
+        """
+        tenant_id = client_config.get('azure_tenant_id')
+        client_id = client_config.get('azure_client_id')
+        client_secret = client_config.get('azure_client_secret')
+        
+        if not all([tenant_id, client_id, client_secret]):
+            logger.error("Credenciales Azure incompletas")
+            return None
+        
+        token_url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
+        
+        token_data = {
+            'grant_type': 'client_credentials',
+            'client_id': client_id,
+            'client_secret': client_secret,
+            'scope': 'https://graph.microsoft.com/.default'
+        }
+        
+        try:
+            response = requests.post(token_url, data = token_data, timeout = 10)
+            response.raise_for_status()
+            
+            token_response = response.json()
+            access_token = token_response.get('access_token')
+            
+            if not access_token:
+                logger.error("No se recibió access_token en la respuesta")
+                return None
+            
+            return access_token
+            
         except requests.exceptions.RequestException as e:
             logger.error(f"Error obteniendo token: {e}")
-            return False
-        
-    def _log_token_permissions(self) -> None:
-        """
-        Log de permisos del token (para debugging)
-        """
-        try:
-            token_parts = self.access_token.split('.')
-            if len(token_parts) > 1:
-                payload = token_parts[1]
-                payload += '=' * (4 - len(payload) % 4)
-                decoded = base64.b64decode(payload)
-                token_info = json.loads(decoded)
-                roles = token_info.get('roles', [])
-                logger.info(f"Permisos activos: {', '.join(roles)}")
-        except Exception:
-            logger.debug("No se pudieron decodificar los permisos del token")
-
-    def _make_graph_request(self, endpoint: str, method: str = 'GET', data: Optional[Dict] = None, params: Optional[Dict] = None) -> Optional[Dict]:
-        """
-        Hace una petición a Microsoft Graph API.
-
-        Args:
-            endpoint: Endpoint de la API.
-            method: Método HTTP.
-            data: Datos para POST/PATCH.
-            params: Parámetros de query.
-
-        Returns:
-            Dict con la respuesta o None si hay error.
-        """
-        if not self.access_token:
-            logger.error("No hay token de acceso disponible")
             return None
+    
+    def _needs_subscription(self, subscription_id: str, expiry_str: str) -> bool:
+        """
+        Determina si un cliente necesita nueva suscripción.
+        
+        Casos:
+        - subscription_id es "pending-..." → SÍ necesita (cliente nuevo)
+        - subscription_id expira en < 12 horas → SÍ necesita (renovar)
+        - subscription_id vigente → NO necesita
+        
+        Args:
+            subscription_id: ID de suscripción actual
+            expiry_str: Fecha de expiración en formato ISO
+            
+        Returns:
+            True si necesita nueva suscripción
+        """
+        # Caso 1: Cliente nuevo (pending)
+        if 'pending' in subscription_id.lower():
+            logger.info("Cliente nuevo detectado (subscription_id='pending')")
+            return True
+        
+        # Caso 2: Verificar expiración
+        if not expiry_str:
+            logger.warning("Sin fecha de expiración, asumiendo que necesita renovación")
+            return True
+        
+        try:
+            # Verificar si expira pronto (buffer de 12 horas)
+            if is_subscription_expired(expiry_str, buffer_hours=12):
+                logger.info("Suscripción próxima a expirar, renovando...")
+                return True
+            else:
+                logger.info(f"Suscripción vigente hasta: {expiry_str}")
+                return False
+                
+        except Exception as e:
+            logger.warning(f"Error verificando expiración: {e}, asumiendo renovación necesaria")
+            return True
+    
+    def _create_subscription_in_graph(self, access_token: str, user_email: str, webhook_url: str) -> Dict:
+        """
+        Crea una suscripción en Microsoft Graph API.
+        
+        Args:
+            access_token: Token de acceso del cliente
+            user_email: Email del usuario a suscribir
+            webhook_url: URL del webhook para notificaciones
+            
+        Returns:
+            Datos de la suscripción creada o None si falla
+        """
+        url = f"{self.graph_api_base}/subscriptions"
         
         headers = {
-            "Authorization": f"Bearer {self.access_token}",
-            "Content-Type": "application/json"
+            'Authorization': f'Bearer {access_token}',
+            'Content-Type': 'application/json'
         }
-
-        url = f"{self.base_url}/{endpoint}"
-
-        try:
-            if method.upper() == 'POST':
-                response = requests.post(url, headers = headers, json = data, params = params, timeout = 30)
-            elif method.upper() == 'DELETE':
-                response = requests.delete(url, headers = headers, params = params, timeout = 30)
-            elif method.upper() == 'PATCH':
-                response = requests.patch(url, headers = headers, json = data, params = params, timeout = 30)
-            else:
-                response = requests.get(url, headers = headers, params = params, timeout = 30)
-
-            if response.status_code in [200, 201, 204]:
-                try:
-                    return response.json()
-                except:
-                    return {"success": True}
-            else:
-                logger.error(f'Error en petición: {response.status_code} - {response.text}')
-                return None
-                
-        except Exception as e:
-            logger.error(f'Excepción en petición: {str(e)}')
-            return None
-    
-    def list_existing_subscriptions(self) -> List[Dict[str, Any]]:
-        """
-        Lista las suscripciones existentes.
         
-        Returns:
-            List de suscripciones existentes.
-        """
-        logger.info("Obteniendo suscripciones existentes...")
-
-        subscriptions_data = self._make_graph_request("/subscriptions")
-
-        if subscriptions_data and 'value' in subscriptions_data:
-            subscriptions = subscriptions_data['value']
-            logger.info(f"Suscripciones encontradas: {len(subscriptions)}")
-
-            for i, sub in enumerate(subscriptions, 1):
-                resource = sub.get('resource', 'N/A')
-                client_state = sub.get('clientState', 'N/A')
-                expiration = sub.get('expirationDateTime', 'N/A')
-
-                # Determinar tipo (protegiendo contra None)
-                resource_lower = (resource or '').lower()
-                client_state_lower = (client_state or '').lower()
-                
-                if 'inbox' in resource_lower:
-                    sub_type = 'INBOX'
-                elif 'hil' in resource_lower or 'hil' in client_state_lower:
-                    sub_type = 'HIL'
-                else:
-                    sub_type = 'OTHER'
-                
-                logger.info(f'{i}. [{sub_type}] ID: {sub.get("id", "N/A")[:20]}...')
-                logger.info(f'Expira: {expiration}')
-
-            return subscriptions
+        # Calcular fecha de expiración (3 días desde ahora)
+        expiration_datetime = datetime.now(timezone.utc) + timedelta(days = 3)
+        expiration_iso = expiration_datetime.isoformat().replace('+00:00', 'Z')
         
-        else:
-            logger.info("No hay suscripciones existentes.")
-            return []
-    
-    def delete_subscription(self, subscription_id: str) -> bool:
-        """
-        Elimina una suscripción.
-
-        Args:
-            subscription_id: ID de la suscripción.
-
-        Returns:
-            bool: True si se eliminó exitosamente.
-        """
-        logger.info(f"Eliminando suscripción...")
-
-        result = self._make_graph_request(f"/subscriptions/{subscription_id}", "DELETE")
-
-        if result is not None:
-            logger.info(f"Suscripción eliminada exitosamente")
-            return True
-        else:
-            logger.error(f"Error al eliminar suscripción")
-            return False
-    
-    def create_inbox_subscription(self) -> Optional[Dict[str, Any]]:
-        """
-        Crea una nueva suscripción para INBOX
-
-        Returns:
-            Dict con la información de la suscripción o None si falla.
-        """
-        logger.info("Creando suscripción INBOX...")
-
-        # Calcular expiración (máximo 4230 minutos para empresarial)
-        try:
-            expiration = datetime.now(timezone.utc) + timedelta(days=2, hours=23)
-
-        except ImportError:
-            expiration = datetime.utcnow() + timedelta(days=2, hours=23)
-
-        expiration_str = expiration.strftime('%Y-%m-%dT%H:%M:%S.0000000Z')
-
-        # ============================================================================
-        # ACTUALIZADO: Ahora usa webhook_url_inbox específica (nuevo servicio AWS)
-        # ============================================================================
-        # CÓDIGO ANTIGUO (comentado para pruebas):
-        # webhook_data = {
-        #     "changeType": "created",
-        #     "notificationUrl": self.config.webhook_url,  # <-- URL antigua compartida
-        #     "resource": f"users/{self.config.target_user_email}/mailFolders/inbox/messages",
-        #     "expirationDateTime": expiration_str,
-        #     "clientState": "InboxSecretState123"
-        # }
-
-        # CÓDIGO NUEVO (activo):
-        webhook_data = {
+        payload = {
             "changeType": "created",
-            "notificationUrl": self.config.webhook_url_inbox,  # <-- URL nueva específica para INBOX
-            "resource": f"users/{self.config.target_user_email}/mailFolders/inbox/messages",
-            "expirationDateTime": expiration_str,
-            "clientState": "InboxSecretState123"
+            "notificationUrl": webhook_url,
+            "resource": f"users/{user_email}/messages",
+            "expirationDateTime": expiration_iso,
+            "clientState": f"mcp-{user_email.split('@')[0]}"  # Estado para validación
         }
-        # ============================================================================
-
-        logger.info(f"Configurando suscripción INBOX que expira: {expiration_str}")
-        logger.info(f"URL notificación INBOX: {self.config.webhook_url_inbox}")
-
-        result = self._make_graph_request("/subscriptions", "POST", webhook_data)
-
-        if result and 'id' in result:
-            logger.info(f"Suscripción INBOX creada: {result.get('id')}")
-            return result
-        else:
-            logger.error("Error al crear suscripción INBOX")
-            return None
-    
-    def get_or_create_hil_folder(self) -> Optional[str]:
-        """
-        Obtiene o crea la carpeta HIL.
-
-        Returns:
-            str: ID de la carpeta HIL o None si falla.
-        """
+        
         try:
-            logger.info("Verificando carpeta HIL...")
-
-            folders_data = self._make_graph_request(f'/users/{self.config.target_user_email}/mailFolders')
-
-            if not folders_data or 'value' not in folders_data:
-                logger.error("No se pudieron obtener las carpetas")
-                return None
-
-            # Buscar carpeta HIL
-            logger.info(f"Total carpetas a revisar: {len(folders_data['value'])}")
-            for folder in folders_data['value']:
-                folder_name = folder.get('displayName') or ''
-                folder_id = folder.get('id')
-
-                # Log TODAS las carpetas para debugging
-                logger.info(f"Carpeta encontrada: '{folder_name}' -> lower: '{folder_name.lower()}'")
-
-                if folder_name.lower() == 'hil':
-                    logger.info(f'✓ Carpeta HIL encontrada: {folder_id}')
-                    return folder_id
-
-            # Si no existe, crearla
-            logger.warning("Carpeta HIL NO encontrada en la búsqueda")
-            logger.info("Intentando crear carpeta HIL...")
-            create_data = {"displayName": "HIL"}
-
-            result = self._make_graph_request(f'/users/{self.config.target_user_email}/mailFolders', 'POST', create_data)
-
-            if result and 'id' in result:
-                folder_id = result['id']
-                logger.info(f'Carpeta HIL creada: {folder_id}')
-                return folder_id
-            else:
-                logger.error("Error creando carpeta HIL")
-                return None
-
+            logger.debug(f"Payload: {payload}")
+            
+            response = requests.post(url, headers = headers, json = payload, timeout = 30)
+            response.raise_for_status()
+            
+            subscription_data = response.json()
+            
+            logger.info(f"Suscripción creada exitosamente")
+            
+            return subscription_data
+            
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"Error HTTP creando suscripción: {e}")
+            logger.error(f"Response: {e.response.text if e.response else 'N/A'}")
+            return None
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error de red creando suscripción: {e}")
+            return None
+        
         except Exception as e:
-            logger.error(f"Error con carpeta HIL: {str(e)}")
+            logger.error(f"Error inesperado: {e}")
             return None
-    
-    def create_hil_subscription(self) -> Optional[Dict[str, Any]]:
-        """
-        Crea una nueva suscripción para HIL.
-
-        Returns:
-            Dict con la información de la suscripción o None si falla.
-        """
-        logger.info("Creando suscripción HIL...")
-
-        # Obtener / crear carpeta HIL
-        hil_folder_id = self.get_or_create_hil_folder()
-        if not hil_folder_id:
-            logger.error("No se pudo obtener o crear la carpeta HIL")
-            return None
-
-        # Calcular expiración
-        try:
-            from datetime import timezone
-            expiration = datetime.now(timezone.utc) + timedelta(days=2, hours=23)
-        except ImportError:
-            expiration = datetime.utcnow() + timedelta(days=2, hours=23)
-
-        expiration_str = expiration.strftime('%Y-%m-%dT%H:%M:%S.0000000Z')
-
-        # ============================================================================
-        # ACTUALIZADO: Ahora usa webhook_url_hil específica (servicio actual)
-        # ============================================================================
-        # CÓDIGO ANTIGUO (comentado para pruebas):
-        # webhook_data = {
-        #     "changeType": "created",
-        #     "notificationUrl": self.config.webhook_url,  # <-- URL antigua compartida
-        #     "resource": f"users/{self.config.target_user_email}/mailFolders/{hil_folder_id}/messages",
-        #     "expirationDateTime": expiration_str,
-        #     "clientState": "HILSecretState456"
-        # }
-
-        # CÓDIGO NUEVO (activo):
-        webhook_data = {
-            "changeType": "created",
-            "notificationUrl": self.config.webhook_url_hil,  # <-- URL específica para HIL
-            "resource": f"users/{self.config.target_user_email}/mailFolders/{hil_folder_id}/messages",
-            "expirationDateTime": expiration_str,
-            "clientState": "HILSecretState456"
-        }
-        # ============================================================================
-
-        logger.info(f"Configurando suscripción HIL que expira: {expiration_str}")
-        logger.info(f"URL notificación HIL: {self.config.webhook_url_hil}")
-
-        result = self._make_graph_request('/subscriptions', 'POST', webhook_data)
-
-        if result and 'id' in result:
-            logger.info(f'Suscripción HIL creada: {result.get("id")}')
-            return result
-        else:
-            logger.error('Error creando suscripción HIL')
-            return None
-    
-    def process_subscriptions(self) -> Dict[str, Any]:
-        """
-        Procesa todas las suscripciones: lista, elimina expiradas y crea nuevas.
-
-        Returns:
-            Dict con el resultado del procesamiento.
-        """
-        results = {
-            "success": True,
-            "existing_subscriptions": 0,
-            "deleted_subscriptions": 0,
-            "created_subscriptions": 0,
-            "errors": []
-        }
-
-        try:
-            # 1. Listar suscripciones existentes
-            existing_subs = self.list_existing_subscriptions()
-            results["existing_subscriptions"] = len(existing_subs)
-
-            # 2. Eliminar suscripciones existentes (para renovar)
-            deleted_count = 0
-            for sub in existing_subs:
-                subscription_id = sub.get('id')  # Corregido: era Subscription_id
-
-                if subscription_id:
-                    if self.delete_subscription(subscription_id):
-                        deleted_count += 1
-                    else:
-                        results["errors"].append(f"Error eliminando suscripción {subscription_id}")
-
-            results["deleted_subscriptions"] = deleted_count
-
-            # 3. Crear nueva suscripción INBOX
-            inbox_result = self.create_inbox_subscription()
-            if inbox_result:
-                results['created_subscriptions'] += 1
-            else:
-                results['errors'].append('Error creando suscripción INBOX')
-                results['success'] = False
-
-            # 4. DESHABILITADO: Suscripción HIL ya no es necesaria
-            # hil_result = self.create_hil_subscription()
-            # if hil_result:
-            #     results['created_subscriptions'] += 1
-            # else:
-            #     results['errors'].append('Error creando suscripción HIL')
-            #     results['success'] = False
-
-            logger.info("Suscripción HIL deshabilitada (ya no es necesaria)")
-            
-            logger.info(f'Procesamiento completado:')
-            logger.info(f'Existentes: {results["existing_subscriptions"]}')
-            logger.info(f'Eliminadas: {results["deleted_subscriptions"]}')
-            logger.info(f'Creadas: {results["created_subscriptions"]}')
-            logger.info(f'Errores: {len(results["errors"])}')
-            
-            return results
-            
-        except Exception as e:
-            logger.error(f'Error en procesamiento: {str(e)}')
-            results['success'] = False
-            results['errors'].append(f'Error crítico: {str(e)}')
-            return results

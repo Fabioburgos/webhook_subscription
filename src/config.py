@@ -1,4 +1,4 @@
-# src/config.py -> 'Configuración y variables de entorno'
+# src/config.py -> 'Configuración GLOBAL (sin credenciales de clientes)'
 
 import os
 from .utils import setup_logging
@@ -6,113 +6,64 @@ from .utils import setup_logging
 logger = setup_logging()
 
 class Config:
-    """ Gestiona la configuración del lambda desde variables de entorno. """
-
+    """
+    Gestiona la configuración GLOBAL del lambda.
+    
+    NOTA IMPORTANTE:
+    Las credenciales específicas de cada cliente (tenant_id, client_id, client_secret)
+    YA NO se leen de variables de entorno. Ahora vienen de DynamoDB.
+    
+    Este config solo contiene configuración global del sistema.
+    """
+    
     def __init__(self):
-        # Microsoft Graph API Credentials
-        self.tenant_id = os.getenv('MS_TENANT_ID')
-        self.client_id = os.getenv('MS_CLIENT_ID')
-        self.client_secret = os.getenv('MS_CLIENT_SECRET')
-
-        # Target configuration
-        self.target_user_email = os.getenv('TARGET_USER_EMAIL')
-
-        # WEBHOOK URLS - Solo INBOX activo
-        # -----------------------------------------------------------------
-        # URL para notificaciones de INBOX
-        self.webhook_url_inbox = os.getenv('WEBHOOK_URL_INBOX')
-
-        # HIL deshabilitado (ya no se usa)
-        # self.webhook_url_hil = os.getenv('WEBHOOK_URL_HIL')
-        # -----------------------------------------------------------------
-
-        # Optional configurations
+        # Configuración de DynamoDB
+        self.dynamodb_table = os.getenv('DYNAMODB_TABLE', 'MCP_ClientConfigurations')
+        self.aws_region = os.getenv('AWS_REGION', 'us-east-2')
+        
+        # Configuración global
         self.log_level = os.getenv('LOG_LEVEL', 'INFO')
-        self.lambda_version = os.getenv('LAMBDA_VERSION', '1.0.0')
-
-        # HIL configuration (for reference)
-        self.hil_forward_email = os.getenv('HIL_FORWARD_TO_EMAIL')
+        self.lambda_version = os.getenv('LAMBDA_VERSION', '2.0.0-multitenant')
+        
+        # Webhook URL base (puede ser la misma para todos los clientes)
+        # Si cada cliente necesita URL diferente, esto viene de DynamoDB
+        self.webhook_url_base = os.getenv('WEBHOOK_URL_BASE')
     
     def validate(self) -> bool:
         """
-        Valida que todas las configuraciones requeridas estén presentes.
-
+        Valida configuración global (ya NO valida credenciales de clientes).
+        
         Returns:
-            bool: True si la configuración es válida.
+            bool: True si la configuración global es válida
         """
-        required_fields = {
-            'MS_TENANT_ID': self.tenant_id,
-            'MS_CLIENT_ID': self.client_id,
-            'MS_CLIENT_SECRET': self.client_secret,
-            'TARGET_USER_EMAIL': self.target_user_email,
-            # Solo validar INBOX (HIL deshabilitado)
-            'WEBHOOK_URL_INBOX': self.webhook_url_inbox
-        }
-
-        missing_fields = []
-
-        for field_name, field_value in required_fields.items():
-            if not field_value:
-                missing_fields.append(field_name)
-
-        if missing_fields:
-            logger.error(f"Variables de entorno faltantes: {', '.join(missing_fields)}")
+        # Solo validar configuración global
+        if not self.dynamodb_table:
+            logger.error("DYNAMODB_TABLE no está configurado")
             return False
-
-        # Validaciones adicionales
-        if not self._validate_email(self.target_user_email):
-            logger.error(f"Email objetivo inválido: {self.target_user_email}")
-            return False
-
-        # Validar URL de INBOX
-        if not self._validate_url(self.webhook_url_inbox):
-            logger.error(f"URL de webhook INBOX inválida: {self.webhook_url_inbox}")
-            return False
-
-        logger.info("Configuración validada exitosamente")
+        
+        logger.info("Configuración global validada exitosamente")
         return True
     
-    def _validate_email(self, email: str) -> bool:
-        """
-        Valida formato básico de email.
-        """
-        return '@' in email and '.' in email.split('@')[-1]
-    
-    def _validate_url(self, url: str) -> bool:
-        """
-        Valida formato básico de URL.
-        """
-        # Incluir tanto http como https
-        return (url.startswith("http://") or url.startswith("https://")) and len(url) > 10
-
     def get_summary(self) -> dict:
         """
-        Retorna un resumen de la configuración (sin secretos).
-
+        Retorna un resumen de la configuración global (sin secretos).
+        
         Returns:
-            dict: Configuraciones resumidas.
+            dict: Configuraciones resumidas
         """
         return {
-            'tenant_id': self.tenant_id,
-            'client_id': self.client_id,
-            'client_secret_set': bool(self.client_secret),
-            'target_user_email': self.target_user_email,
-            # Solo INBOX activo
-            'webhook_url_inbox': self.webhook_url_inbox,
-            'hil_forward_email': self.hil_forward_email,
+            'dynamodb_table': self.dynamodb_table,
+            'aws_region': self.aws_region,
+            'webhook_url_base': self.webhook_url_base or 'N/A',
             'log_level': self.log_level,
             'lambda_version': self.lambda_version
         }
     
     def log_config(self) -> None:
-        """
-        Log de configuración actual (sin secretos).
-        """
-        logger.info("Configuración actual:")
-        logger.info(f"Tenant: {self.tenant_id}")
-        logger.info(f"Client: {self.client_id}")
-        logger.info(f"Usuario objetivo: {self.target_user_email}")
-        # Solo INBOX activo
-        logger.info(f"Webhook URL INBOX: {self.webhook_url_inbox}")
-        logger.info(f"HIL forward: {self.hil_forward_email or 'No configurado'}")
-        logger.info(f"Log Level: {self.log_level}")
+        """Log de configuración actual"""
+        logger.info("Configuración Global:")
+        logger.info(f"  DynamoDB Table: {self.dynamodb_table}")
+        logger.info(f"  AWS Region: {self.aws_region}")
+        logger.info(f"  Webhook URL Base: {self.webhook_url_base or 'N/A'}")
+        logger.info(f"  Log Level: {self.log_level}")
+        logger.info(f"  Version: {self.lambda_version}")
